@@ -46,7 +46,7 @@ union FlagRegister {
     ULONG_PTR zf : 1;          ///< [6] Zero flag
     ULONG_PTR sf : 1;          ///< [7] Sign flag
     ULONG_PTR tf : 1;          ///< [8] Trap flag
-    ULONG_PTR IF : 1;          ///< [9] Interrupt flag
+    ULONG_PTR intf : 1;        ///< [9] Interrupt flag
     ULONG_PTR df : 1;          ///< [10] Direction flag
     ULONG_PTR of : 1;          ///< [11] Overflow flag
     ULONG_PTR iopl : 2;        ///< [12:13] I/O privilege level
@@ -179,6 +179,35 @@ static_assert(sizeof(Gdtr) == 10, "Size check");
 static_assert(sizeof(Idtr) == 6, "Size check");
 static_assert(sizeof(Gdtr) == 6, "Size check");
 #endif
+#include <poppack.h>
+
+/// IDT entry (nt!_KIDTENTRY)
+#include <pshpack1.h>
+union KidtEntry {
+  ULONG64 all;
+  struct
+  {
+    unsigned short offset_low;
+    unsigned short selector;
+    unsigned char ist_index:3;    ///< [0:2]
+    unsigned char reserved :5;    ///< [3:7]
+    unsigned char type :5;        ///< [8:12]
+    unsigned char dpl :2;         ///< [13:14]
+    unsigned char present :1;     ///< [15]
+    unsigned short offset_middle;
+  } fields;
+};
+static_assert(sizeof(KidtEntry) == 8, "Size check");
+#include <poppack.h>
+
+/// IDT entry for x64 (nt!_KIDTENTRY64)
+#include <pshpack1.h>
+struct KidtEntry64 {
+  KidtEntry idt_entry;
+  ULONG32 offset_high;
+  ULONG32 reserved;
+};
+static_assert(sizeof(KidtEntry64) == 16, "Size check");
 #include <poppack.h>
 
 /// See: Segment Selectors
@@ -1003,13 +1032,16 @@ union Ia32VmxEptVpidCapMsr {
 };
 static_assert(sizeof(Ia32VmxEptVpidCapMsr) == 8, "Size check");
 
-/// See: VM-ENTRY FAILURES DURING OR AFTER LOADING GUEST STATE
+/// See: Format of Exit Reason in Basic VM-Exit Information
 union VmExitInformation {
   unsigned int all;
   struct {
-    VmxExitReason reason;                 ///< [0:15]
-    unsigned short reserved : 15;         ///< [16:30]
-    unsigned short vm_entry_failure : 1;  ///< [31]
+    VmxExitReason reason;                      ///< [0:15]
+    unsigned short reserved1 : 12;             ///< [16:30]
+    unsigned short pending_mtf_vm_exit : 1;    ///< [28]
+    unsigned short vm_exit_from_vmx_root : 1;  ///< [29]
+    unsigned short reserved2 : 1;              ///< [30]
+    unsigned short vm_entry_failure : 1;       ///< [31]
   } fields;
 };
 static_assert(sizeof(VmExitInformation) == 4, "Size check");

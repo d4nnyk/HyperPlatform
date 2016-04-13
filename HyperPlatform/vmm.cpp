@@ -35,7 +35,7 @@ static const long kVmmpEnableRecordVmExit = false;
 static const long kVmmpNumberOfRecords = 100;
 
 // How many processors are supported for recording
-static const long kVmmpNumberOfProcessors = 4;
+static const long kVmmpNumberOfProcessors = 2;
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -94,6 +94,8 @@ DECLSPEC_NORETURN static void VmmpHandleTripleFault(
 DECLSPEC_NORETURN static void VmmpHandleUnexpectedExit(
     _Inout_ GuestContext *guest_context);
 
+static void VmmpHandleMonitorTrap(_Inout_ GuestContext *guest_context);
+
 static void VmmpHandleException(_Inout_ GuestContext *guest_context);
 
 static void VmmpHandleCpuid(_Inout_ GuestContext *guest_context);
@@ -146,8 +148,8 @@ static void VmmpAdjustGuestInstructionPointer(_In_ ULONG_PTR guest_ip);
 
 // Those variables are all for diagnostic purpose
 static ULONG g_vmmp_next_history_index[kVmmpNumberOfProcessors];
-static VmExitHistory
-    g_vmmp_vm_exit_history[kVmmpNumberOfProcessors][kVmmpNumberOfRecords];
+static VmExitHistory g_vmmp_vm_exit_history[kVmmpNumberOfProcessors]
+                                           [kVmmpNumberOfRecords];
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -202,7 +204,7 @@ _Use_decl_annotations_ static void VmmpHandleVmExit(
 
   if (kVmmpEnableRecordVmExit) {
     // Save them for ease of trouble shooting
-    const auto processor = KeGetCurrentProcessorNumber();
+    const auto processor = KeGetCurrentProcessorNumberEx(nullptr);
     auto &index = g_vmmp_next_history_index[processor];
     auto &history = g_vmmp_vm_exit_history[processor][index];
 
@@ -246,6 +248,9 @@ _Use_decl_annotations_ static void VmmpHandleVmExit(
       break;
     case VmxExitReason::kMsrWrite:
       VmmpHandleMsrWriteAccess(guest_context);
+      break;
+    case VmxExitReason::kMonitorTrapFlag:
+      VmmpHandleMonitorTrap(guest_context);
       break;
     case VmxExitReason::kGdtrOrIdtrAccess:
       VmmpHandleGdtrOrIdtrAccess(guest_context);
@@ -303,6 +308,15 @@ _Use_decl_annotations_ static void VmmpHandleUnexpectedExit(
                                  0);
 }
 
+// MTF VM-exit
+_Use_decl_annotations_ static void VmmpHandleMonitorTrap(
+    GuestContext *guest_context) {
+  VmmpDumpGuestSelectors();
+  HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnexpectedVmExit,
+                                 reinterpret_cast<ULONG_PTR>(guest_context), 0,
+                                 0);
+}
+
 // Interrupt
 _Use_decl_annotations_ static void VmmpHandleException(
     GuestContext *guest_context) {
@@ -348,7 +362,8 @@ _Use_decl_annotations_ static void VmmpHandleException(
                                   guest_context->ip, error_code);
 
     } else {
-      HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnknown, 0, 0, 0);
+      HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnspecified, 0, 0,
+                                     0);
     }
 
   } else if (static_cast<interruption_type>(
@@ -368,10 +383,12 @@ _Use_decl_annotations_ static void VmmpHandleException(
       HYPERPLATFORM_LOG_INFO_SAFE("GuestIp= %p, #BP ", guest_context->ip);
 
     } else {
-      HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnknown, 0, 0, 0);
+      HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnspecified, 0, 0,
+                                     0);
     }
   } else {
-    HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnknown, 0, 0, 0);
+    HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnspecified, 0, 0,
+                                   0);
   }
 }
 
@@ -429,9 +446,10 @@ _Use_decl_annotations_ static void VmmpHandleRdtscp(
 _Use_decl_annotations_ static void VmmpHandleXsetbv(
     GuestContext *guest_context) {
   HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
-  AsmXsetbv(static_cast<ULONG>(guest_context->gp_regs->cx),
-            static_cast<ULONG>(guest_context->gp_regs->dx),
-            static_cast<ULONG>(guest_context->gp_regs->ax));
+  ULARGE_INTEGER value = {};
+  value.LowPart = static_cast<ULONG>(guest_context->gp_regs->ax);
+  value.HighPart = static_cast<ULONG>(guest_context->gp_regs->dx);
+  _xsetbv(static_cast<ULONG>(guest_context->gp_regs->cx), value.QuadPart);
 
   VmmpAdjustGuestInstructionPointer(guest_context->ip);
 }
@@ -487,9 +505,6 @@ _Use_decl_annotations_ static void VmmpHandleMsrAccess(
   NT_ASSERT(UtilIsInBounds(vmcs_field, VmcsField::kIoBitmapA,
                            VmcsField::kHostIa32PerfGlobalCtrlHigh) == false);
 
-  // This unconditional __readmsr and __writemsr may cause #GP resulting in
-  // bug check. A proper way to solve this is check supported MSR values
-  // beforehand and inject an exception when unsupported MSR values are given.
   LARGE_INTEGER msr_value = {};
   if (read_access) {
     if (transfer_to_vmcs) {
@@ -725,7 +740,8 @@ _Use_decl_annotations_ static void VmmpHandleDrAccess(
       // clang-format on
       break;
     default:
-      HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnknown, 0, 0, 0);
+      HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnspecified, 0, 0,
+                                     0);
       break;
   }
 
@@ -743,66 +759,76 @@ _Use_decl_annotations_ static void VmmpHandleCrAccess(
       VmmpSelectRegister(exit_qualification.fields.gp_register, guest_context);
 
   switch (static_cast<MovCrAccessType>(exit_qualification.fields.access_type)) {
-    case MovCrAccessType::kMoveToCr: {
+    case MovCrAccessType::kMoveToCr:
       switch (exit_qualification.fields.control_register) {
         // CR0 <- Reg
-        case 0:
+        case 0: {
+          HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
           if (UtilIsX86Pae()) {
             UtilLoadPdptes(UtilVmRead(VmcsField::kGuestCr3));
           }
           UtilVmWrite(VmcsField::kGuestCr0, *register_used);
           UtilVmWrite(VmcsField::kCr0ReadShadow, *register_used);
           break;
+        }
 
         // CR3 <- Reg
-        case 3:
+        case 3: {
+          HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
           if (UtilIsX86Pae()) {
             UtilLoadPdptes(*register_used);
           }
           UtilVmWrite(VmcsField::kGuestCr3, *register_used);
           break;
+        }
 
         // CR4 <- Reg
-        case 4:
+        case 4: {
+          HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
           if (UtilIsX86Pae()) {
             UtilLoadPdptes(UtilVmRead(VmcsField::kGuestCr3));
           }
           UtilVmWrite(VmcsField::kGuestCr4, *register_used);
           UtilVmWrite(VmcsField::kCr4ReadShadow, *register_used);
           break;
+        }
 
         // CR8 <- Reg
-        case 8:
+        case 8: {
+          HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
           guest_context->cr8 = *register_used;
           break;
+        }
 
         default:
-          HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnknown, 0, 0,
-                                         0);
+          HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnspecified, 0,
+                                         0, 0);
           break;
       }
-    } break;
+      break;
 
-    // Note that MOV from CRx should never cause VM-exit with the current
-    // settings. This is just for case when you enable it.
-    case MovCrAccessType::kMoveFromCr: {
+    case MovCrAccessType::kMoveFromCr:
       switch (exit_qualification.fields.control_register) {
         // Reg <- CR3
-        case 3:
+        case 3: {
+          HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
           *register_used = UtilVmRead(VmcsField::kGuestCr3);
           break;
+        }
 
         // Reg <- CR8
-        case 8:
+        case 8: {
+          HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
           *register_used = guest_context->cr8;
           break;
+        }
 
         default:
-          HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnknown, 0, 0,
-                                         0);
+          HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnspecified, 0,
+                                         0, 0);
           break;
       }
-    } break;
+      break;
 
     // Unimplemented
     case MovCrAccessType::kClts:
@@ -833,10 +859,11 @@ _Use_decl_annotations_ static void VmmpHandleVmCall(
     GuestContext *guest_context) {
   // VMCALL for Sushi expects that cx holds a command number, and dx holds an
   // address of a context parameter optionally
-  const auto hypercall_number = guest_context->gp_regs->cx;
+  const auto hypercall_number =
+      static_cast<HypercallNumber>(guest_context->gp_regs->cx);
   const auto context = reinterpret_cast<void *>(guest_context->gp_regs->dx);
 
-  if (hypercall_number == kHyperPlatformVmmBackdoorCode) {
+  if (hypercall_number == HypercallNumber::kTerminateVmm) {
     // Unloading requested
     HYPERPLATFORM_COMMON_DBG_BREAK();
 
@@ -878,8 +905,6 @@ _Use_decl_annotations_ static void VmmpHandleVmCall(
     guest_context->gp_regs->ax = guest_context->flag_reg.all;
     guest_context->vm_continue = false;
 
-    UtilInveptAll();
-
   } else {
     // Unsupported hypercall. Handle like other VMX instructions
     VmmpHandleVmx(guest_context);
@@ -899,8 +924,8 @@ _Use_decl_annotations_ static void VmmpHandleInvalidateTLBEntry(
     GuestContext *guest_context) {
   HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
   const auto invalidate_address =
-      static_cast<ULONG_PTR>(UtilVmRead(VmcsField::kExitQualification));
-  AsmInvlpg(invalidate_address);
+      reinterpret_cast<void *>(UtilVmRead(VmcsField::kExitQualification));
+  __invlpg(invalidate_address);
   VmmpAdjustGuestInstructionPointer(guest_context->ip);
 }
 
@@ -908,8 +933,8 @@ _Use_decl_annotations_ static void VmmpHandleInvalidateTLBEntry(
 _Use_decl_annotations_ static void VmmpHandleEptViolation(
     GuestContext *guest_context) {
   HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
-  EptHandleEptViolation(
-      guest_context->stack->processor_data->shared_data->ept_data);
+  auto processor_data = guest_context->stack->processor_data;
+  EptHandleEptViolation(processor_data->ept_data);
 }
 
 // EXIT_REASON_EPT_MISCONFIG
@@ -918,8 +943,11 @@ _Use_decl_annotations_ static void VmmpHandleEptMisconfig(
   UNREFERENCED_PARAMETER(guest_context);
 
   const auto fault_address = UtilVmRead(VmcsField::kGuestPhysicalAddress);
-  UNREFERENCED_PARAMETER(fault_address);
-  HYPERPLATFORM_COMMON_DBG_BREAK();
+  const auto ept_pt_entry = EptGetEptPtEntry(
+      guest_context->stack->processor_data->ept_data, fault_address);
+  HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kEptMisconfigVmExit,
+                                 fault_address,
+                                 reinterpret_cast<ULONG_PTR>(ept_pt_entry), 0);
 }
 
 // Selects a register to be used based on the index

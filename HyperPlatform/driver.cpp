@@ -5,6 +5,9 @@
 /// @file
 /// Implements an entry point of the driver.
 
+#ifndef POOL_NX_OPTIN
+#define POOL_NX_OPTIN 1
+#endif
 #include "driver.h"
 #include "common.h"
 #include "log.h"
@@ -73,6 +76,9 @@ _Use_decl_annotations_ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object,
   driver_object->DriverUnload = DriverpDriverUnload;
   HYPERPLATFORM_COMMON_DBG_BREAK();
 
+  // Request NX Non-Paged Pool when available
+  ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
+
   // Initialize log functions
   bool need_reinitialization = false;
   status = LogInitialization(kLogLevel, kLogFilePath);
@@ -84,6 +90,7 @@ _Use_decl_annotations_ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object,
 
   // Test if the system is supported
   if (!DriverpIsSuppoetedOS()) {
+    LogTermination();
     return STATUS_CANCELLED;
   }
 
@@ -95,7 +102,7 @@ _Use_decl_annotations_ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object,
   }
 
   // Initialize utility functions
-  status = UtilInitialization();
+  status = UtilInitialization(driver_object);
   if (!NT_SUCCESS(status)) {
     PerfTermination();
     LogTermination();

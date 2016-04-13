@@ -58,27 +58,13 @@ static const auto kVmxpNumberOfPreallocatedEntries = 50;
 // types
 //
 
-// A structure consists of common fields across all EPT entry types
-union EptCommonEntry {
-  ULONG64 all;
-  struct {
-    ULONG64 read_access : 1;       // [0]
-    ULONG64 write_access : 1;      // [1]
-    ULONG64 execute_access : 1;    // [2]
-    ULONG64 memory_type : 3;       // [3:5]
-    ULONG64 reserved1 : 6;         // [6:11]
-    ULONG64 physial_address : 36;  // [12:48-1]
-    ULONG64 reserved2 : 16;        // [48:63]
-  } fields;
-};
-static_assert(sizeof(EptCommonEntry) == 8, "Size check");
-
+// EPT related data stored in ProcessorSharedData
 struct EptData {
   EptPointer *ept_pointer;
   EptCommonEntry *ept_pml4;
 
-  EptCommonEntry **preallocated_entries;
-  volatile long preallocated_entries_count;
+  EptCommonEntry **preallocated_entries;  // An array of pre-allocated entries
+  volatile long preallocated_entries_count;  // # of used pre-allocated entries
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -152,6 +138,7 @@ static void EptpFreeUnusedPreAllocatedEntries(
 // implementations
 //
 
+// Checks if the system supports EPT technology sufficient enough
 _Use_decl_annotations_ bool EptIsEptAvailable() {
   PAGED_CODE();
 
@@ -159,7 +146,7 @@ _Use_decl_annotations_ bool EptIsEptAvailable() {
   __cpuidex(regs, 0x80000008, 0);
   Cpuid80000008Eax cpuidEax = {static_cast<ULONG32>(regs[0])};
   HYPERPLATFORM_LOG_DEBUG("Physical Address Range = %d bits",
-                           cpuidEax.fields.physical_address_bits);
+                          cpuidEax.fields.physical_address_bits);
 
   // No processors supporting the Intel 64 architecture support more than 48
   // physical-address bits
@@ -181,10 +168,12 @@ _Use_decl_annotations_ bool EptIsEptAvailable() {
   return true;
 }
 
+// Returns an EPT pointer from ept_data
 _Use_decl_annotations_ ULONG64 EptGetEptPointer(EptData *ept_data) {
   return ept_data->ept_pointer->all;
 }
 
+// Builds EPT, allocates pre-allocated enties, initializes and returns EptData
 _Use_decl_annotations_ EptData *EptInitialization() {
   PAGED_CODE();
 
@@ -447,27 +436,17 @@ _Use_decl_annotations_ void EptHandleEptViolation(EptData *ept_data) {
       !exit_qualification.fields.ept_executable) {
     // EPT entry miss. It should be device memory.
     HYPERPLATFORM_PERFORMANCE_MEASURE_THIS_SCOPE();
-    // HYPERPLATFORM_LOG_DEBUG_SAFE(
-    //    "[INIT] Dev VA = %p, PA = %016llx, Used = %d",
-    //    0, fault_pa, ept_data->preallocated_entries_count);
 
     if (!IsReleaseBuild()) {
-      const auto is_device_memory = EptpIsDeviceMemory(fault_pa);
-      NT_ASSERT(is_device_memory);
-      UNREFERENCED_PARAMETER(is_device_memory);
+      NT_VERIFY(EptpIsDeviceMemory(fault_pa));
     }
-
-    // There is a race condition here. If multiple processors reach this code
-    // with the same fault_pa, this function may create multiple EPT entries for
-    // one physical address and leads memory leak. This call should probably be
-    // guarded by a spin-lock but is not yet just because impact is so small.
     EptpConstructTables(ept_data->ept_pml4, 4, fault_pa, ept_data);
 
     UtilInveptAll();
 
   } else {
     HYPERPLATFORM_LOG_DEBUG_SAFE("[IGNR] OTH VA = %p, PA = %016llx", fault_va,
-                                  fault_pa);
+                                 fault_pa);
   }
 }
 
@@ -486,6 +465,12 @@ _Use_decl_annotations_ static bool EptpIsDeviceMemory(
     }
   }
   return true;
+}
+
+// Returns an EPT entry corresponds to the physical_address
+_Use_decl_annotations_ EptCommonEntry *EptGetEptPtEntry(
+    EptData *ept_data, ULONG64 physical_address) {
+  return EptpGetEptPtEntry(ept_data->ept_pml4, 4, physical_address);
 }
 
 // Returns an EPT entry corresponds to the physical_address
